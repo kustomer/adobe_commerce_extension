@@ -1,0 +1,7 @@
+.admin__menu .level-0.item-kustomer > a:before {
+  content: '';
+  background-image: url('../images/icon-kustomer.png');
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
+}

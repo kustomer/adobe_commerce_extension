@@ -1,0 +1,10 @@
+<!-- ko if: $col.getLabel($row()) == 'Success' -->
+<div class="data-grid-cell-content"
+     data-bind="css:'grid-severity-notice'"
+     text="$col.getLabel($row())"></div>
+<!-- /ko -->
+<!-- ko if: $col.getLabel($row()) == 'Failed' -->
+<div class="data-grid-cell-content"
+     data-bind="css:'grid-severity-major'"
+     text="$col.getLabel($row())"></div>
+<!-- /ko -->

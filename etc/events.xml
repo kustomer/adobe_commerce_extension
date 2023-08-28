@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:Event/etc/events.xsd">
+    <event name="customer_address_save_commit_after">
+        <observer name="kustomer_customer_address_save_commit_after" instance="Kustomer\WebhookIntegration\Observer\Address" />
+    </event>
+    <event name="customer_save_commit_after">
+        <observer name="kustomer_customer_save_commit_after" instance="Kustomer\WebhookIntegration\Observer\Customer" />
+    </event>
+    <event name="sales_order_save_commit_after">
+        <observer name="kustomer_sales_order_save_commit_after" instance="Kustomer\WebhookIntegration\Observer\Order" />
+    </event>
+    <event name="admin_sales_order_address_update">
+        <observer name="kustomer_admin_sales_order_address_update" instance="Kustomer\WebhookIntegration\Observer\OrderAddress" />
+    </event>
+</config>

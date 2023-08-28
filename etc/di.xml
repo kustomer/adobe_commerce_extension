@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+  <type name="Magento\Framework\View\Element\UiComponent\DataProvider\CollectionFactory">
+    <arguments>
+      <argument name="collections" xsi:type="array">
+        <item name="kustomer_webhookintegration_event_log_data_source" xsi:type="string">KustomerWebhookIntegrationEventCollection</item>
+      </argument>
+    </arguments>
+  </type>
+  <virtualType name="KustomerWebhookIntegrationEventCollection" type="Kustomer\WebhookIntegration\Ui\DataProvider\Event\Collection">
+    <arguments>
+      <argument name="mainTable" xsi:type="string">kustomer_webhook_integration_events</argument>
+      <argument name="resourceModel" xsi:type="string">Kustomer\WebhookIntegration\Model\ResourceModel\Event\Collection</argument>
+    </arguments>
+  </virtualType>
+</config>
