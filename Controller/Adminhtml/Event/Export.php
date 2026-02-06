@@ -11,6 +11,16 @@ use Kustomer\WebhookIntegration\Helper\Data;
 class Export extends Action
 {
   /**
+   * @var ResultFactory
+   */
+  protected $_resultFactory;
+
+  /**
+   * @var UrlInterface
+   */
+  protected $_urlBuilder;
+
+  /**
    * @var Data
    */
   protected $_webhookHelper;

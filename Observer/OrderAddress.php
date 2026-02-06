@@ -10,6 +10,16 @@ use Magento\Sales\Api\OrderRepositoryInterface;
 class OrderAddress implements ObserverInterface
 {
   /**
+   * @var Data
+   */
+  protected $helper;
+
+  /**
+   * @var OrderRepositoryInterface
+   */
+  protected $_orderRepository;
+
+  /**
    * Constructor
    * @param Data $helper
    * @param OrderRepositoryInterface $orderRepository

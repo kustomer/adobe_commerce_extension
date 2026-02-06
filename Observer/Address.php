@@ -9,6 +9,11 @@ use Kustomer\WebhookIntegration\Helper\Data;
 class Address implements ObserverInterface
 {
   /**
+   * @var Data
+   */
+  protected $helper;
+
+  /**
    * Constructor
    * @param Data $helper
    */

@@ -9,6 +9,11 @@ use Kustomer\WebhookIntegration\Helper\Data;
 class Customer implements ObserverInterface
 {
   /**
+   * @var Data
+   */
+  protected $helper;
+
+  /**
    * Constructor
    * @param Data $helper
    */
