@@ -216,6 +216,8 @@ class Data extends AbstractHelper
       CURLOPT_RETURNTRANSFER => true,
       CURLOPT_CUSTOMREQUEST => 'POST',
       CURLOPT_POSTFIELDS => $encodedPayload,
+      CURLOPT_CONNECTTIMEOUT_MS => 3000,
+      CURLOPT_TIMEOUT_MS => 10000,
       CURLOPT_HTTPHEADER => [
         'Accept: application/json',
         'Token: ' . $hashedToken,
