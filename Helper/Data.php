@@ -216,6 +216,8 @@ class Data extends AbstractHelper
       CURLOPT_RETURNTRANSFER => true,
       CURLOPT_CUSTOMREQUEST => 'POST',
       CURLOPT_POSTFIELDS => $encodedPayload,
+      CURLOPT_CONNECTTIMEOUT_MS => 3000,
+      CURLOPT_TIMEOUT_MS => 10000,
       CURLOPT_HTTPHEADER => [
         'Accept: application/json',
         'Token: ' . $hashedToken,
@@ -227,17 +229,29 @@ class Data extends AbstractHelper
       ],
     ]);
 
-    // Submit the request
-    $response = curl_exec($curl);
-    $statusCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+    try {
+      // Submit the request
+      $response = curl_exec($curl);
 
-    // If there's an error, log and throw an exception
-    if ($statusCode !== 200) {
-      throw new \Exception($response);
+      // curl_exec returns false on failure (including timeouts)
+      if ($response === false) {
+        throw new \Exception(sprintf(
+          'cURL error (%d): %s',
+          curl_errno($curl),
+          curl_error($curl)
+        ));
+      }
+
+      $statusCode = (int) curl_getinfo($curl, CURLINFO_HTTP_CODE);
+
+      // If there's an error, log and throw an exception
+      if ($statusCode !== 200) {
+        throw new \Exception(sprintf('HTTP %d: %s', $statusCode, $response));
+      }
+    } finally {
+      // Always close the cURL session handle
+      curl_close($curl);
     }
-
-    // Close cURL session handle
-    curl_close($curl);
 
     // Return the response
     return json_decode($response, true);
