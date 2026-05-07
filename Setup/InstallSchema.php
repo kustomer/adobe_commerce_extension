@@ -67,8 +67,18 @@ class InstallSchema implements InstallSchemaInterface
           null,
           ['nullable' => false, 'default' => Table::TIMESTAMP_INIT_UPDATE],
           'Last Sent At'
-        )
-        ->setComment('Kustomer Webhook Event Table');
+        );
+
+      // Queue columns — shared with UpgradeSchema via QueueColumns::definitions()
+      // so the two install paths cannot drift. See Setup/QueueColumns.php.
+      foreach (QueueColumns::definitions() as $name => $def) {
+        $length = $def['length'] ?? null;
+        $options = $def;
+        unset($options['type'], $options['length'], $options['comment']);
+        $table->addColumn($name, $def['type'], $length, $options, $def['comment']);
+      }
+
+      $table->setComment('Kustomer Webhook Event Table');
 
       $setup->getConnection()->createTable($table);
 
