@@ -50,13 +50,38 @@ class Retry extends Action
   public function execute()
   {
     // Get the ID of the event to retry
-    $id = $this->getRequest()->getParam('id');
+    $id = (int) $this->getRequest()->getParam('id');
 
-    // If the ID is set, retry the event and show a success message
     if ($id) {
-      $this->_webhookHelper->retry($id);
+      $row = $this->_webhookHelper->loadEventState($id);
 
-      $this->_messageManager->addSuccessMessage(__('Retried event #' . $id));
+      if (!$row) {
+        $this->_messageManager->addErrorMessage(__('Event #%1 not found.', $id));
+      } else {
+        $state = $row['state'] ?? null;
+
+        // Allow retry only for terminal failures. In the o-webhooks-worker-aligned
+        // state model, "terminal" is encoded as state='failed' AND next_attempt_at IS NULL
+        // (matches the canonical "failed transaction with no nextRetry" pattern).
+        // Also allow for unmigrated edge-case rows where state is NULL and status = 0.
+        $isTerminal = (
+          $state === 'failed' && $row['next_attempt_at'] === null
+        ) || (
+          $state === null && (int)$row['status'] === 0
+        );
+
+        if ($isTerminal) {
+          $this->_webhookHelper->requeueForRetry($id);
+          $this->_messageManager->addSuccessMessage(__('Event #%1 queued for retry.', $id));
+        } else {
+          $displayState = $state ?? 'unknown';
+          $this->_messageManager->addErrorMessage(__(
+            'Event #%1 cannot be retried in state "%2"; only terminally-failed events are eligible.',
+            $id,
+            $displayState
+          ));
+        }
+      }
     }
 
     // Redirect to the index page

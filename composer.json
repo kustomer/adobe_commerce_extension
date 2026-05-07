@@ -2,7 +2,7 @@
   "name": "kustomer/webhook-integration",
   "description": "An extension that posts Magento/Adobe Commerce data to Kustomer via webhooks",
   "type": "magento2-module",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "license": [],
   "require": {
     "php": "^8.1"
