@@ -425,11 +425,12 @@ class Data extends AbstractHelper
    */
   public function send($payload)
   {
-    // Log the payload
-    $this->logger->info('Sending data to Kustomer', $payload);
-
     $token = $this->getSecurityToken();
-    $this->logger->info('Security token', [ 'token' => $token ]);
+
+    $this->logger->info('Sending data to Kustomer', [
+      'event_type' => $payload['event']['type'] ?? null,
+      'event_name' => $payload['event']['name'] ?? null,
+    ]);
 
     // Set the event ID to null
     $eventId = null;
@@ -474,8 +475,11 @@ class Data extends AbstractHelper
     $event = $this->eventFactory->create()->load($eventId);
     $payload = json_decode($event->getData('payload'), true);
 
-    // Log the payload
-    $this->logger->info('Retrying the sending of data to Kustomer', $payload);
+    $this->logger->info('Retrying the sending of data to Kustomer', [
+      'event_id'   => $eventId,
+      'event_type' => $payload['event']['type'] ?? null,
+      'event_name' => $payload['event']['name'] ?? null,
+    ]);
 
     try {
       // Try to send the payload
