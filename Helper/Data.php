@@ -154,10 +154,7 @@ class Data extends AbstractHelper
    */
   private function getExtensionVersion()
   {
-    $composerJson = file_get_contents(
-      $this->_directoryList->getPath('app') .
-        '/code/Kustomer/WebhookIntegration/composer.json'
-    );
+    $composerJson = file_get_contents(__DIR__ . '/../composer.json');
     $composerJson = json_decode($composerJson, true);
 
     return $composerJson['version'];
