@@ -326,9 +326,20 @@ class Data extends AbstractHelper
       $connection = $this->_resourceConnection->getConnection();
       $tableName  = $this->_resourceConnection->getTableName('kustomer_webhook_integration_events');
 
+      // JSON_THROW_ON_ERROR turns malformed UTF-8 / recursive payloads into
+      // a thrown JsonException instead of a silent `false` return — without
+      // it the row would persist with payload='' or 'false' and become an
+      // undecodable dead letter that deliverEvent re-fails every retry tick.
+      // The throw is caught by the outer try/catch and goes through the
+      // fail-open log path, same as any other INSERT-time failure.
+      $encodedPayload = json_encode(
+        $payload,
+        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+      );
+
       $connection->insert($tableName, [
         'store_id'       => $storeId,
-        'payload'        => json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+        'payload'        => $encodedPayload,
         'status'         => 0,
         'uri'            => $this->getWebhookUrl(),
         'state'          => 'pending',
@@ -367,7 +378,8 @@ class Data extends AbstractHelper
    * Does NOT touch any state column — that is the caller's responsibility.
    *
    * @param int    $eventId
-   * @param string $workerId  (unused by HTTP layer, reserved for future tracing)
+   * @param string $workerId  Caller's lease owner; row is only delivered if
+   *                          this worker still owns an unexpired lease.
    * @return string|null  null on HTTP 200; otherwise a truncated error message
    *                      that the caller should persist via recordFailedAttempt.
    */
@@ -376,13 +388,32 @@ class Data extends AbstractHelper
     $connection = $this->_resourceConnection->getConnection();
     $tableName  = $this->_resourceConnection->getTableName('kustomer_webhook_integration_events');
 
+    // Verify lease ownership before any external side effect. Without this
+    // check, a worker whose lease has already expired and been recovered by
+    // another worker would still perform the HTTP POST, producing a duplicate
+    // delivery whose DB-side update is later rejected by the conditional
+    // UPDATE — visible to the caller as a logged warning, but invisible to
+    // Kustomer, which has already received the redundant webhook.
+    //
+    // The window cannot be eliminated entirely (the lease can expire between
+    // this SELECT and the cURL completion), but the check shrinks it from
+    // "the entire claim → cURL latency" to "the SELECT → cURL gap." Kustomer
+    // idempotency on stable externalId is still the load-bearing safety net.
     $row = $connection->fetchRow(
-      $connection->select()->from($tableName)->where('event_id = ?', $eventId)
+      $connection->select()
+        ->from($tableName)
+        ->where('event_id = ?', $eventId)
+        ->where('state = ?', 'processing')
+        ->where('locked_by = ?', $workerId)
+        ->where('locked_until > NOW()')
     );
 
     if (!$row) {
-      $this->logger->error('deliverEvent: event row not found', ['event_id' => $eventId]);
-      return 'event row not found';
+      $this->logger->warning('deliverEvent: lease no longer owned, skipping delivery', [
+        'event_id'  => $eventId,
+        'worker_id' => $workerId,
+      ]);
+      return 'lease no longer owned';
     }
 
     $payload = json_decode($row['payload'], true);
