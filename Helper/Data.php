@@ -566,8 +566,13 @@ class Data extends AbstractHelper
     // Without this, rows written during the PR 3 / PR 4 deployment window
     // would carry schema defaults (state='pending', next_attempt_at=NULL)
     // that misrepresent the row in the admin grid and fail PR 4's gate.
+    // store_id is a NOT NULL FK; the pre-PR3 saveRequest never wrote it and
+    // relied on MySQL's silent coercion to 0 (the admin scope). enqueue()
+    // already fixes this for the async path; mirror the fix here so the
+    // synchronous and async writers agree during the PR 3 → PR 4 window.
     $isSuccess = $error === null;
     $event->setData([
+      'store_id'        => (int) ($payload['event']['store']['id'] ?? 0),
       'payload'         => json_encode($payload),
       'status'          => $isSuccess ? 1 : 0,
       'uri'             => $this->getWebhookUrl(),
@@ -598,8 +603,12 @@ class Data extends AbstractHelper
     // Same state-mirror invariant as saveRequest(): the synchronous retry
     // path is one-shot, so both outcomes are terminal in the new state model.
     // retry_count is incremented to reflect the additional attempt.
+    // Re-assert store_id from the payload so a row originally written under
+    // the pre-PR3 buggy path (which omitted store_id and got an implicit 0)
+    // is corrected on retry.
     $isSuccess = $error === null;
     $event->addData([
+      'store_id'        => (int) ($payload['event']['store']['id'] ?? 0),
       'payload'         => json_encode($payload),
       'status'          => $isSuccess ? 1 : 0,
       'uri'             => $this->getWebhookUrl(),
