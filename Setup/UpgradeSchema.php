@@ -27,7 +27,14 @@ class UpgradeSchema implements UpgradeSchemaInterface
       }
 
       // Backfill state from legacy status column for existing rows.
-      // status=1 => success, status=0 => terminal_failed, NULL => pending.
+      // Mirrors o-webhooks-worker convention (see dev-monorepo/js/o-webhooks-worker
+      // service/transaction_service.js): succeeded vs failed are the only
+      // terminal state values; retryable-vs-terminal is encoded by
+      // next_attempt_at — a non-NULL future timestamp means "will retry,"
+      // NULL means "won't retry."
+      //   status=1 (legacy success)  => succeeded, next_attempt_at NULL
+      //   status=0 (legacy failure)  => failed,    next_attempt_at NULL (terminal)
+      //   status IS NULL             => pending,   next_attempt_at NOW()
       // Guarded against partially-altered schemas: if the table or the legacy
       // status column is missing, skip the backfill rather than aborting setup.
       if (
@@ -35,25 +42,32 @@ class UpgradeSchema implements UpgradeSchemaInterface
         && $connection->tableColumnExists($tableName, 'status')
         && $connection->tableColumnExists($tableName, 'state')
       ) {
-        $backfillDefaults = [
-          'retry_count'     => 0,
-          'next_attempt_at' => null,
-          'locked_until'    => null,
-          'locked_by'       => null,
+        $lockReset = [
+          'retry_count'  => 0,
+          'locked_until' => null,
+          'locked_by'    => null,
         ];
 
         $backfills = [
-          ['state' => 'success',         'where' => ['status = ?' => 1]],
-          ['state' => 'terminal_failed', 'where' => ['status = ?' => 0]],
-          ['state' => 'pending',         'where' => ['status IS NULL']],
+          [
+            'where'  => ['status = ?' => 1],
+            'values' => array_merge(['state' => 'succeeded', 'next_attempt_at' => null], $lockReset),
+          ],
+          [
+            'where'  => ['status = ?' => 0],
+            'values' => array_merge(['state' => 'failed', 'next_attempt_at' => null], $lockReset),
+          ],
+          [
+            'where'  => ['status IS NULL'],
+            'values' => array_merge(
+              ['state' => 'pending', 'next_attempt_at' => new \Zend_Db_Expr('NOW()')],
+              $lockReset
+            ),
+          ],
         ];
 
         foreach ($backfills as $backfill) {
-          $connection->update(
-            $tableName,
-            array_merge(['state' => $backfill['state']], $backfillDefaults),
-            $backfill['where']
-          );
+          $connection->update($tableName, $backfill['values'], $backfill['where']);
         }
       }
     }
