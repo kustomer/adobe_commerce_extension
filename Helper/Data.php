@@ -270,9 +270,18 @@ class Data extends AbstractHelper
 
       $statusCode = (int) curl_getinfo($curl, CURLINFO_HTTP_CODE);
 
-      // If there's an error, log and throw an exception
+      // If there's an error, log and throw an exception.
+      // The exception message intentionally omits the response body because
+      // it ends up persisted in kustomer_webhook_integration_events.error
+      // (and exported via Helper\Data::export()) and could embed anything
+      // Kustomer returned — internal diagnostic strings, request ids, etc.
+      // The full body is captured in app logs for ephemeral debugging.
       if ($statusCode !== 200) {
-        throw new \Exception(sprintf('HTTP %d: %s', $statusCode, $response));
+        $this->logger->error('Kustomer webhook returned non-200', [
+          'status_code'   => $statusCode,
+          'response_body' => substr((string)$response, 0, 1000),
+        ]);
+        throw new \Exception(sprintf('HTTP %d', $statusCode));
       }
     } finally {
       // Always close the cURL session handle
@@ -297,6 +306,36 @@ class Data extends AbstractHelper
   public function stateToStatus(string $state): int
   {
     return $state === 'succeeded' ? 1 : 0;
+  }
+
+  /**
+   * Normalize an error string before it gets persisted to the
+   * kustomer_webhook_integration_events.error column. The column is
+   * surfaced via the admin grid and Helper\Data::export(), so any
+   * upstream error message that may contain control characters,
+   * embedded newlines, or other operator-unfriendly content is reduced
+   * to a single printable line capped at 200 characters.
+   *
+   * Upstream exception messages already strip response bodies at the
+   * source (see sendApiRequest()), so the typical input here is a
+   * libcurl error description or a short status code. This is a
+   * defense-in-depth pass for anything that slips through.
+   *
+   * @param string|null $error
+   * @return string|null
+   */
+  private function sanitizeErrorForPersistence($error): ?string
+  {
+    if ($error === null || $error === '') {
+      return $error;
+    }
+    // Replace ASCII control chars (newlines, tabs, NUL, DEL, etc.) with a
+    // single space, then collapse whitespace runs and trim. Truncate to
+    // 200 chars to match the prior substr bound and avoid blowing the
+    // column out.
+    $clean = preg_replace('/[\x00-\x1F\x7F]+/', ' ', (string)$error) ?? '';
+    $clean = preg_replace('/\s+/', ' ', $clean) ?? '';
+    return substr(trim($clean), 0, 200);
   }
 
   /**
@@ -494,7 +533,7 @@ class Data extends AbstractHelper
       'state'       => 'failed',
       'status'      => $this->stateToStatus('failed'),
       'retry_count' => $newRetryCount,
-      'error'       => substr($error, 0, 200),
+      'error'       => $this->sanitizeErrorForPersistence($error),
       'locked_by'   => null,
       'locked_until'=> null,
     ];
