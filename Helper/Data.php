@@ -17,15 +17,21 @@ use Magento\Sales\Api\OrderRepositoryInterface;
 class Data extends AbstractHelper
 {
   /**
-   * Maximum number of delivery attempts before a row transitions to terminal_failed.
-   * Attempt 1 sets retry_count=1, ..., attempt MAX_RETRIES sets retry_count=MAX_RETRIES
-   * which triggers terminal_failed on the next recordFailedAttempt call.
+   * Number of retries permitted after the initial delivery attempt. With
+   * MAX_RETRIES=4 a row is attempted up to 5 times (initial + 4 retries):
+   *   attempt 1 (retry_count=0 -> 1, schedule using ladder[0] = 60s)
+   *   attempt 2 (retry_count=1 -> 2, schedule using ladder[1] = 300s)
+   *   attempt 3 (retry_count=2 -> 3, schedule using ladder[2] = 1800s)
+   *   attempt 4 (retry_count=3 -> 4, schedule using ladder[3] = 7200s)
+   *   attempt 5 (retry_count=4 -> 5, terminal: next_attempt_at = NULL)
+   * Terminal transition fires when newRetryCount > MAX_RETRIES.
    */
   const MAX_RETRIES = 4;
 
   /**
-   * Backoff ladder in seconds, indexed by new retry_count after increment.
-   * [1m, 5m, 30m, 2h]. Out-of-range index clamps to last value.
+   * Backoff ladder in seconds, indexed by (newRetryCount - 1) so the first
+   * retry uses 60s. Entries: 1m, 5m, 30m, 2h. Out-of-range index clamps to
+   * the last value (defensive — should not happen given the terminal guard).
    */
   private static $backoffLadder = [60, 300, 1800, 7200];
 
@@ -305,21 +311,20 @@ class Data extends AbstractHelper
    */
   public function enqueue(array $payload): void
   {
+    // Precondition check runs OUTSIDE the try/catch so a buggy caller surfaces
+    // as a real exception instead of being silently routed to the fail-open
+    // log. store_id is a NOT NULL FK to store.store_id; passing an unset/zero
+    // value is a programmer error, not a runtime DB failure.
+    $storeId = (int) ($payload['event']['store']['id'] ?? 0);
+    if ($storeId <= 0) {
+      throw new \InvalidArgumentException(
+        'enqueue: payload missing event.store.id; caller must populate store data'
+      );
+    }
+
     try {
       $connection = $this->_resourceConnection->getConnection();
       $tableName  = $this->_resourceConnection->getTableName('kustomer_webhook_integration_events');
-
-      // Precondition: caller must populate $payload['event']['store'] via
-      // getStoreData() before enqueue (mirrors today's send() behavior).
-      // store_id is a NOT NULL FK to store.store_id; an unset/zero value
-      // would surface as an FK violation and silently route to the
-      // fail-open log. Fail loudly here so the bug is in the caller.
-      $storeId = (int) ($payload['event']['store']['id'] ?? 0);
-      if ($storeId <= 0) {
-        throw new \InvalidArgumentException(
-          'enqueue: payload missing event.store.id; caller must populate store data'
-        );
-      }
 
       $connection->insert($tableName, [
         'store_id'       => $storeId,
@@ -463,8 +468,10 @@ class Data extends AbstractHelper
       'locked_until'=> null,
     ];
 
-    if ($newRetryCount >= self::MAX_RETRIES) {
+    if ($newRetryCount > self::MAX_RETRIES) {
       // Terminal: NULL next_attempt_at signals "won't retry."
+      // newRetryCount==MAX_RETRIES is still retryable (uses ladder's last
+      // entry) — terminal only fires once retries are exhausted.
       $data['next_attempt_at'] = null;
     } else {
       // Retryable: schedule next attempt per the backoff ladder.
