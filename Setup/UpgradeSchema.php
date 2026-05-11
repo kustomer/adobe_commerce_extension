@@ -28,25 +28,33 @@ class UpgradeSchema implements UpgradeSchemaInterface
 
       // Backfill state from legacy status column for existing rows.
       // status=1 => success, status=0 => terminal_failed, NULL => pending.
-      $backfillDefaults = [
-        'retry_count'     => 0,
-        'next_attempt_at' => null,
-        'locked_until'    => null,
-        'locked_by'       => null,
-      ];
+      // Guarded against partially-altered schemas: if the table or the legacy
+      // status column is missing, skip the backfill rather than aborting setup.
+      if (
+        $setup->tableExists($tableName)
+        && $connection->tableColumnExists($tableName, 'status')
+        && $connection->tableColumnExists($tableName, 'state')
+      ) {
+        $backfillDefaults = [
+          'retry_count'     => 0,
+          'next_attempt_at' => null,
+          'locked_until'    => null,
+          'locked_by'       => null,
+        ];
 
-      $backfills = [
-        ['state' => 'success',         'where' => ['status = ?' => 1]],
-        ['state' => 'terminal_failed', 'where' => ['status = ?' => 0]],
-        ['state' => 'pending',         'where' => ['status IS NULL']],
-      ];
+        $backfills = [
+          ['state' => 'success',         'where' => ['status = ?' => 1]],
+          ['state' => 'terminal_failed', 'where' => ['status = ?' => 0]],
+          ['state' => 'pending',         'where' => ['status IS NULL']],
+        ];
 
-      foreach ($backfills as $backfill) {
-        $connection->update(
-          $tableName,
-          array_merge(['state' => $backfill['state']], $backfillDefaults),
-          $backfill['where']
-        );
+        foreach ($backfills as $backfill) {
+          $connection->update(
+            $tableName,
+            array_merge(['state' => $backfill['state']], $backfillDefaults),
+            $backfill['where']
+          );
+        }
       }
     }
 
