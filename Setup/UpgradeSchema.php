@@ -32,9 +32,16 @@ class UpgradeSchema implements UpgradeSchemaInterface
       // terminal state values; retryable-vs-terminal is encoded by
       // next_attempt_at — a non-NULL future timestamp means "will retry,"
       // NULL means "won't retry."
-      //   status=1 (legacy success)  => succeeded, next_attempt_at NULL
-      //   status=0 (legacy failure)  => failed,    next_attempt_at NULL (terminal)
-      //   status IS NULL             => pending,   next_attempt_at NOW()
+      //   status=1 (legacy success) => succeeded, next_attempt_at NULL
+      //   status=0 (legacy failure) => failed,    next_attempt_at NULL (terminal)
+      //   status IS NULL            => failed,    next_attempt_at NULL (terminal)
+      //
+      // The third case is defensive — saveRequest() always wrote 0 or 1, so
+      // status=NULL rows shouldn't exist in normal operation. If any do exist
+      // (direct SQL, historical bug, partial write), we treat them as terminal
+      // failures so they surface in the admin grid for manual review rather
+      // than getting auto-delivered with unknown intent.
+      //
       // Guarded against partially-altered schemas: if the table or the legacy
       // status column is missing, skip the backfill rather than aborting setup.
       if (
@@ -42,27 +49,25 @@ class UpgradeSchema implements UpgradeSchemaInterface
         && $connection->tableColumnExists($tableName, 'status')
         && $connection->tableColumnExists($tableName, 'state')
       ) {
-        $lockReset = [
-          'retry_count'  => 0,
-          'locked_until' => null,
-          'locked_by'    => null,
+        $terminalValues = [
+          'next_attempt_at' => null,
+          'retry_count'     => 0,
+          'locked_until'    => null,
+          'locked_by'       => null,
         ];
 
         $backfills = [
           [
             'where'  => ['status = ?' => 1],
-            'values' => array_merge(['state' => 'succeeded', 'next_attempt_at' => null], $lockReset),
+            'values' => array_merge(['state' => 'succeeded'], $terminalValues),
           ],
           [
             'where'  => ['status = ?' => 0],
-            'values' => array_merge(['state' => 'failed', 'next_attempt_at' => null], $lockReset),
+            'values' => array_merge(['state' => 'failed'], $terminalValues),
           ],
           [
             'where'  => ['status IS NULL'],
-            'values' => array_merge(
-              ['state' => 'pending', 'next_attempt_at' => new \Zend_Db_Expr('NOW()')],
-              $lockReset
-            ),
+            'values' => array_merge(['state' => 'failed'], $terminalValues),
           ],
         ];
 
