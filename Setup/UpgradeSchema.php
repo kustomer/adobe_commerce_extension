@@ -60,18 +60,23 @@ class UpgradeSchema implements UpgradeSchemaInterface
           'locked_by'       => null,
         ];
 
+        // Per the stateToStatus mirror that lands in PR 3:
+        //   'succeeded' => status=1, every other state => status=0.
+        // Backfill 'status' explicitly on the third case so legacy status=NULL
+        // rows have a consistent non-NULL value for readers (Helper::export,
+        // the admin grid's select component) that key off status.
         $backfills = [
           [
             'where'  => ['status = ?' => 1],
-            'values' => array_merge(['state' => 'succeeded'], $terminalValues),
+            'values' => array_merge(['state' => 'succeeded', 'status' => 1], $terminalValues),
           ],
           [
             'where'  => ['status = ?' => 0],
-            'values' => array_merge(['state' => 'failed'], $terminalValues),
+            'values' => array_merge(['state' => 'failed', 'status' => 0], $terminalValues),
           ],
           [
             'where'  => ['status IS NULL'],
-            'values' => array_merge(['state' => 'failed'], $terminalValues),
+            'values' => array_merge(['state' => 'failed', 'status' => 0], $terminalValues),
           ],
         ];
 
