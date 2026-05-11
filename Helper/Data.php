@@ -525,17 +525,25 @@ class Data extends AbstractHelper
     // Store the data somewhere
     $data = [];
 
-    // Loop through the events and append them to the data array
+    // Loop through the events and append them to the data array.
+    // Includes the async queue columns (state, retry_count, next_attempt_at,
+    // locked_until, locked_by) added in setup_version 1.1.0 so support can
+    // see queue state when triaging delivery issues.
     foreach ($events as $event) {
       $data[] = [
-        'id' => $event['event_id'],
-        'store_id' => $event['store_id'],
-        'payload' => json_decode($event['payload'], true),
-        'status' => $event['status'],
-        'uri' => $event['uri'],
-        'error' => $event['error'],
-        'created_at' => $event['created_at'],
-        'last_sent_at' => $event['last_sent_at'],
+        'id'              => $event['event_id'],
+        'store_id'        => $event['store_id'],
+        'payload'         => json_decode($event['payload'], true),
+        'status'          => $event['status'],
+        'state'           => $event['state'] ?? null,
+        'retry_count'     => $event['retry_count'] ?? null,
+        'next_attempt_at' => $event['next_attempt_at'] ?? null,
+        'locked_until'    => $event['locked_until'] ?? null,
+        'locked_by'       => $event['locked_by'] ?? null,
+        'uri'             => $event['uri'],
+        'error'           => $event['error'],
+        'created_at'      => $event['created_at'],
+        'last_sent_at'    => $event['last_sent_at'],
       ];
     }
 
