@@ -363,9 +363,10 @@ class Data extends AbstractHelper
    *
    * @param int    $eventId
    * @param string $workerId  (unused by HTTP layer, reserved for future tracing)
-   * @return bool  true on HTTP 200, false on any error
+   * @return string|null  null on HTTP 200; otherwise a truncated error message
+   *                      that the caller should persist via recordFailedAttempt.
    */
-  public function deliverEvent(int $eventId, string $workerId): bool
+  public function deliverEvent(int $eventId, string $workerId): ?string
   {
     $connection = $this->_resourceConnection->getConnection();
     $tableName  = $this->_resourceConnection->getTableName('kustomer_webhook_integration_events');
@@ -376,25 +377,26 @@ class Data extends AbstractHelper
 
     if (!$row) {
       $this->logger->error('deliverEvent: event row not found', ['event_id' => $eventId]);
-      return false;
+      return 'event row not found';
     }
 
     $payload = json_decode($row['payload'], true);
     if ($payload === null) {
       $this->logger->error('deliverEvent: failed to decode payload', ['event_id' => $eventId]);
-      return false;
+      return 'failed to decode payload';
     }
 
     try {
       $this->performHttpDelivery($payload);
-      return true;
+      return null;
     } catch (\Exception $e) {
+      $errorMsg = substr($e->getMessage(), 0, 200);
       $this->logger->error('deliverEvent: HTTP delivery failed', [
         'event_id'   => $eventId,
         'error_class' => get_class($e),
-        'error'      => substr($e->getMessage(), 0, 200),
+        'error'      => $errorMsg,
       ]);
-      return false;
+      return $errorMsg;
     }
   }
 
@@ -549,12 +551,23 @@ class Data extends AbstractHelper
     // Create a new event model
     $event = $this->eventFactory->create();
 
-    // Set the event data
+    // Populate the new state-machine columns alongside the legacy status.
+    // The synchronous send path makes a single attempt with no auto-retry,
+    // so the outcome is always terminal: success → 'succeeded', failure →
+    // 'failed' with next_attempt_at NULL (which is how the new admin Retry
+    // gate identifies terminal-failed rows eligible for manual requeue).
+    // Without this, rows written during the PR 3 / PR 4 deployment window
+    // would carry schema defaults (state='pending', next_attempt_at=NULL)
+    // that misrepresent the row in the admin grid and fail PR 4's gate.
+    $isSuccess = $error === null;
     $event->setData([
-      'payload' => json_encode($payload),
-      'status' => $error !== null ? 0 : 1,
-      'uri' => $this->getWebhookUrl(),
-      'error' => $error,
+      'payload'         => json_encode($payload),
+      'status'          => $isSuccess ? 1 : 0,
+      'uri'             => $this->getWebhookUrl(),
+      'error'           => $error,
+      'state'           => $isSuccess ? 'succeeded' : 'failed',
+      'retry_count'     => $isSuccess ? 0 : 1,
+      'next_attempt_at' => null,
     ]);
 
     // Save the event
@@ -575,13 +588,19 @@ class Data extends AbstractHelper
     // Load the event
     $event = $this->eventFactory->create()->load($eventId);
 
-    // Update the event data
+    // Same state-mirror invariant as saveRequest(): the synchronous retry
+    // path is one-shot, so both outcomes are terminal in the new state model.
+    // retry_count is incremented to reflect the additional attempt.
+    $isSuccess = $error === null;
     $event->addData([
-      'payload' => json_encode($payload),
-      'status' => $error !== null ? 0 : 1,
-      'uri' => $this->getWebhookUrl(),
-      'error' => $error,
-      'last_sent_at' => date('Y-m-d H:i:s', time()),
+      'payload'         => json_encode($payload),
+      'status'          => $isSuccess ? 1 : 0,
+      'uri'             => $this->getWebhookUrl(),
+      'error'           => $error,
+      'last_sent_at'    => date('Y-m-d H:i:s', time()),
+      'state'           => $isSuccess ? 'succeeded' : 'failed',
+      'retry_count'     => (int)$event->getData('retry_count') + 1,
+      'next_attempt_at' => null,
     ]);
 
     // Update the event

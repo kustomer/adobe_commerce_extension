@@ -180,10 +180,13 @@ LIMIT :batch_size";
    */
   private function processRow($connection, string $tableName, int $eventId, string $workerId): void
   {
+    $errorMsg = null;
     try {
-      $success = $this->helper->deliverEvent($eventId, $workerId);
+      // deliverEvent returns null on success, otherwise a truncated error
+      // message that we persist verbatim so the admin grid / export carries
+      // the real cURL/HTTP reason (parity with the legacy synchronous path).
+      $errorMsg = $this->helper->deliverEvent($eventId, $workerId);
     } catch (\Throwable $t) {
-      $success = false;
       $errorMsg = substr($t->getMessage(), 0, 200);
       $this->logger->error('Kustomer cron: unexpected exception in deliverEvent', [
         'event_id'    => $eventId,
@@ -191,6 +194,7 @@ LIMIT :batch_size";
         'error'       => $errorMsg,
       ]);
     }
+    $success = $errorMsg === null;
 
     if ($success) {
       // Conditional UPDATE: only write if we still own the lock.
@@ -220,9 +224,6 @@ WHERE `event_id` = :event_id
         ]);
       }
     } else {
-      // Resolve the error string from deliverEvent's structured log or use a placeholder.
-      $errorMsg = 'delivery failed';
-
       $updated = $this->helper->recordFailedAttempt(
         $eventId,
         $errorMsg,
