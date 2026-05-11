@@ -20,9 +20,13 @@ class UpgradeSchema implements UpgradeSchemaInterface
       // Idempotent column adds — guard each so a partial-upgrade rerun
       // doesn't fail with ER_DUP_FIELDNAME. Definitions are shared with
       // InstallSchema via QueueColumns::definitions() to prevent drift.
-      foreach (QueueColumns::definitions() as $name => $def) {
-        if (!$connection->tableColumnExists($tableName, $name)) {
-          $connection->addColumn($tableName, $name, $def);
+      // Outer guard: skip entirely if the table is missing (partial install)
+      // rather than throwing during tableColumnExists()/addColumn().
+      if ($setup->tableExists($tableName)) {
+        foreach (QueueColumns::definitions() as $name => $def) {
+          if (!$connection->tableColumnExists($tableName, $name)) {
+            $connection->addColumn($tableName, $name, $def);
+          }
         }
       }
 
