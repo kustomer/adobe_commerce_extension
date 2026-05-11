@@ -103,11 +103,15 @@ class ProcessQueue
    */
   private function recoverExpiredLeases($connection, string $tableName): void
   {
+    // Bounded to BATCH_SIZE so a deploy-induced burst of orphaned rows can't
+    // chew through the cron tick before any new work is claimed. Remaining
+    // orphans are picked up by subsequent ticks.
     $expiredRows = $connection->fetchAll(
       $connection->select()
         ->from($tableName, ['event_id', 'locked_by'])
         ->where('state = ?', 'processing')
         ->where('locked_until <= NOW()')
+        ->limit(self::BATCH_SIZE)
     );
 
     foreach ($expiredRows as $row) {

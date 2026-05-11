@@ -309,7 +309,17 @@ class Data extends AbstractHelper
       $connection = $this->_resourceConnection->getConnection();
       $tableName  = $this->_resourceConnection->getTableName('kustomer_webhook_integration_events');
 
+      // Precondition: caller must populate $payload['event']['store'] via
+      // getStoreData() before enqueue (mirrors today's send() behavior).
+      // store_id is a NOT NULL FK to store.store_id; an unset/zero value
+      // would surface as an FK violation and silently route to the
+      // fail-open log. Fail loudly here so the bug is in the caller.
       $storeId = (int) ($payload['event']['store']['id'] ?? 0);
+      if ($storeId <= 0) {
+        throw new \InvalidArgumentException(
+          'enqueue: payload missing event.store.id; caller must populate store data'
+        );
+      }
 
       $connection->insert($tableName, [
         'store_id'       => $storeId,
@@ -456,8 +466,11 @@ class Data extends AbstractHelper
       $data['next_attempt_at'] = null;
     } else {
       // Retryable: schedule next attempt per the backoff ladder.
+      // newRetryCount is the post-increment count (1 after first failure),
+      // so the ladder is indexed by (newRetryCount - 1) to use ladder[0]
+      // for the wait between attempt 1 and attempt 2.
       $backoffSeconds = self::$backoffLadder[
-        min($newRetryCount, count(self::$backoffLadder) - 1)
+        min($newRetryCount - 1, count(self::$backoffLadder) - 1)
       ];
       $data['next_attempt_at'] = new \Zend_Db_Expr(
         'DATE_ADD(NOW(), INTERVAL ' . (int)$backoffSeconds . ' SECOND)'
@@ -475,15 +488,20 @@ class Data extends AbstractHelper
    * Resets state to 'pending' with retry_count=0, mirroring a fresh enqueue.
    * The row is immediately eligible because next_attempt_at = NOW().
    *
+   * Guarded by a conditional predicate so a double-clicked admin button
+   * (or any caller that races with the cron consumer) cannot yank an
+   * in-flight row out from under a worker. Only terminally-failed rows
+   * are eligible, matching the gate in the admin Retry controller.
+   *
    * @param int $eventId
-   * @return void
+   * @return bool true if a row was reset, false if it was not terminal-failed.
    */
-  public function requeueForRetry(int $eventId): void
+  public function requeueForRetry(int $eventId): bool
   {
     $connection = $this->_resourceConnection->getConnection();
     $tableName  = $this->_resourceConnection->getTableName('kustomer_webhook_integration_events');
 
-    $connection->update(
+    $affected = $connection->update(
       $tableName,
       [
         'state'           => 'pending',
@@ -494,8 +512,14 @@ class Data extends AbstractHelper
         'locked_until'    => null,
         'error'           => null,
       ],
-      ['event_id = ?' => $eventId]
+      [
+        'event_id = ?'      => $eventId,
+        'state = ?'         => 'failed',
+        'next_attempt_at IS NULL',
+      ]
     );
+
+    return $affected > 0;
   }
 
   // -------------------------------------------------------------------------
