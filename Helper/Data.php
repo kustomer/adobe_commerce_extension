@@ -19,21 +19,24 @@ class Data extends AbstractHelper
   /**
    * Number of retries permitted after the initial delivery attempt. With
    * MAX_RETRIES=4 a row is attempted up to 5 times (initial + 4 retries):
-   *   attempt 1 (retry_count=0 -> 1, schedule using ladder[0] = 60s)
-   *   attempt 2 (retry_count=1 -> 2, schedule using ladder[1] = 300s)
-   *   attempt 3 (retry_count=2 -> 3, schedule using ladder[2] = 1800s)
-   *   attempt 4 (retry_count=3 -> 4, schedule using ladder[3] = 7200s)
+   *   attempt 1 (retry_count=0 -> 1, schedule using ladder[0] = 30s)
+   *   attempt 2 (retry_count=1 -> 2, schedule using ladder[1] = 120s)
+   *   attempt 3 (retry_count=2 -> 3, schedule using ladder[2] = 300s)
+   *   attempt 4 (retry_count=3 -> 4, schedule using ladder[3] = 600s)
    *   attempt 5 (retry_count=4 -> 5, terminal: next_attempt_at = NULL)
-   * Terminal transition fires when newRetryCount > MAX_RETRIES.
+   * Total delivery budget across all 5 attempts is ~17 minutes before a
+   * row becomes terminally failed and surfaces in the admin grid for
+   * manual review. Terminal transition fires when newRetryCount > MAX_RETRIES.
    */
   const MAX_RETRIES = 4;
 
   /**
    * Backoff ladder in seconds, indexed by (newRetryCount - 1) so the first
-   * retry uses 60s. Entries: 1m, 5m, 30m, 2h. Out-of-range index clamps to
+   * retry uses 30s. Entries: 30s, 2m, 5m, 10m — keeps individual waits
+   * inside common admin-attention windows. Out-of-range index clamps to
    * the last value (defensive — should not happen given the terminal guard).
    */
-  private static $backoffLadder = [60, 300, 1800, 7200];
+  private static $backoffLadder = [30, 120, 300, 600];
 
   /**
    * @var FileFactory
