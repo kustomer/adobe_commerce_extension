@@ -284,7 +284,7 @@ While not breaking in PHP 8.3/8.4, adding return types improves type safety:
 
 ### Refactor ObjectManager Usage (Optional)
 
-`Helper/Data.php` uses `ObjectManager::getInstance()` in 4 places (lines 77-78, 127-128, 147-149, 171-173). This is a Magento anti-pattern but NOT a PHP 8.3/8.4 compatibility issue. Consider refactoring to use proper dependency injection if time permits.
+`Helper/Data.php` uses `ObjectManager::getInstance()` in 4 places (lines 77-78, 127-128, 147-149, 171-173). This is a Magento anti-pattern but NOT a PHP 8.3/8.4 compatibility issue. Consider refactoring to use proper [dependency injection](https://developer.adobe.com/commerce/php/development/components/dependency-injection/) if time permits.
 
 ---
 
