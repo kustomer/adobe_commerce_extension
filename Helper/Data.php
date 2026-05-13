@@ -17,6 +17,28 @@ use Magento\Sales\Api\OrderRepositoryInterface;
 class Data extends AbstractHelper
 {
   /**
+   * Number of retries permitted after the initial delivery attempt. With
+   * MAX_RETRIES=4 a row is attempted up to 5 times (initial + 4 retries):
+   *   attempt 1 (retry_count=0 -> 1, schedule using ladder[0] = 30s)
+   *   attempt 2 (retry_count=1 -> 2, schedule using ladder[1] = 120s)
+   *   attempt 3 (retry_count=2 -> 3, schedule using ladder[2] = 300s)
+   *   attempt 4 (retry_count=3 -> 4, schedule using ladder[3] = 600s)
+   *   attempt 5 (retry_count=4 -> 5, terminal: next_attempt_at = NULL)
+   * Total delivery budget across all 5 attempts is ~17 minutes before a
+   * row becomes terminally failed and surfaces in the admin grid for
+   * manual review. Terminal transition fires when newRetryCount > MAX_RETRIES.
+   */
+  const MAX_RETRIES = 4;
+
+  /**
+   * Backoff ladder in seconds, indexed by (newRetryCount - 1) so the first
+   * retry uses 30s. Entries: 30s, 2m, 5m, 10m — keeps individual waits
+   * inside common admin-attention windows. Out-of-range index clamps to
+   * the last value (defensive — should not happen given the terminal guard).
+   */
+  private static $backoffLadder = [30, 120, 300, 600];
+
+  /**
    * @var FileFactory
    */
   protected $_fileFactory;
@@ -46,6 +68,11 @@ class Data extends AbstractHelper
    */
   protected $_orderRepository;
 
+  /**
+   * @var \Magento\Framework\App\ResourceConnection
+   */
+  protected $_resourceConnection;
+
   public function __construct(
     Context $context,
     EventFactory $eventFactory,
@@ -54,7 +81,8 @@ class Data extends AbstractHelper
     File $file,
     AddressRepositoryInterface $addressRepository,
     CustomerRepositoryInterface $customerRepository,
-    OrderRepositoryInterface $orderRepository
+    OrderRepositoryInterface $orderRepository,
+    \Magento\Framework\App\ResourceConnection $resourceConnection = null
   ) {
     parent::__construct($context);
 
@@ -66,6 +94,10 @@ class Data extends AbstractHelper
     $this->_addressRepository = $addressRepository;
     $this->_customerRepository = $customerRepository;
     $this->_orderRepository = $orderRepository;
+    // ResourceConnection provides raw DB access needed for atomic queue operations.
+    // Default argument allows the existing constructor signature to remain compatible.
+    $this->_resourceConnection = $resourceConnection
+      ?: ObjectManager::getInstance()->get(\Magento\Framework\App\ResourceConnection::class);
   }
 
   /**
@@ -241,9 +273,18 @@ class Data extends AbstractHelper
 
       $statusCode = (int) curl_getinfo($curl, CURLINFO_HTTP_CODE);
 
-      // If there's an error, log and throw an exception
+      // If there's an error, log and throw an exception.
+      // The exception message intentionally omits the response body because
+      // it ends up persisted in kustomer_webhook_integration_events.error
+      // (and exported via Helper\Data::export()) and could embed anything
+      // Kustomer returned — internal diagnostic strings, request ids, etc.
+      // The full body is captured in app logs for ephemeral debugging.
       if ($statusCode !== 200) {
-        throw new \Exception(sprintf('HTTP %d: %s', $statusCode, $response));
+        $this->logger->error('Kustomer webhook returned non-200', [
+          'status_code'   => $statusCode,
+          'response_body' => substr((string)$response, 0, 1000),
+        ]);
+        throw new \Exception(sprintf('HTTP %d', $statusCode));
       }
     } finally {
       // Always close the cURL session handle
@@ -252,6 +293,332 @@ class Data extends AbstractHelper
 
     // Return the response
     return json_decode($response, true);
+  }
+
+  // -------------------------------------------------------------------------
+  // Queue helpers (added in PR 3 — used by cron consumer; not yet called by
+  // send() or retry(), which remain synchronous until PR 4).
+  // -------------------------------------------------------------------------
+
+  /**
+   * Map a state string to the legacy status integer mirror.
+   *
+   * @param string $state
+   * @return int
+   */
+  public function stateToStatus(string $state): int
+  {
+    return $state === 'succeeded' ? 1 : 0;
+  }
+
+  /**
+   * Normalize an error string before it gets persisted to the
+   * kustomer_webhook_integration_events.error column. The column is
+   * surfaced via the admin grid and Helper\Data::export(), so any
+   * upstream error message that may contain control characters,
+   * embedded newlines, or other operator-unfriendly content is reduced
+   * to a single printable line capped at 200 characters.
+   *
+   * Upstream exception messages already strip response bodies at the
+   * source (see sendApiRequest()), so the typical input here is a
+   * libcurl error description or a short status code. This is a
+   * defense-in-depth pass for anything that slips through.
+   *
+   * @param string|null $error
+   * @return string|null
+   */
+  private function sanitizeErrorForPersistence($error): ?string
+  {
+    if ($error === null || $error === '') {
+      return $error;
+    }
+    // Replace ASCII control chars (newlines, tabs, NUL, DEL, etc.) with a
+    // single space, then collapse whitespace runs and trim. Truncate to
+    // 200 chars to match the prior substr bound and avoid blowing the
+    // column out.
+    $clean = preg_replace('/[\x00-\x1F\x7F]+/', ' ', (string)$error) ?? '';
+    $clean = preg_replace('/\s+/', ' ', $clean) ?? '';
+    return substr(trim($clean), 0, 200);
+  }
+
+  /**
+   * Enqueue a webhook payload as a new pending row.
+   *
+   * Fail-open: if the INSERT fails, a structured error is written to
+   * var/log/kustomer_webhook_enqueue_failure.log and the exception is
+   * swallowed so the merchant's commerce action is not blocked.
+   *
+   * @param array $payload
+   * @return void
+   */
+  public function enqueue(array $payload): void
+  {
+    // Precondition check runs OUTSIDE the try/catch so a buggy caller surfaces
+    // as a real exception instead of being silently routed to the fail-open
+    // log. store_id is a NOT NULL FK to store.store_id; passing an unset/zero
+    // value is a programmer error, not a runtime DB failure.
+    $storeId = (int) ($payload['event']['store']['id'] ?? 0);
+    if ($storeId <= 0) {
+      throw new \InvalidArgumentException(
+        'enqueue: payload missing event.store.id; caller must populate store data'
+      );
+    }
+
+    try {
+      $connection = $this->_resourceConnection->getConnection();
+      $tableName  = $this->_resourceConnection->getTableName('kustomer_webhook_integration_events');
+
+      // JSON_THROW_ON_ERROR turns malformed UTF-8 / recursive payloads into
+      // a thrown JsonException instead of a silent `false` return — without
+      // it the row would persist with payload='' or 'false' and become an
+      // undecodable dead letter that deliverEvent re-fails every retry tick.
+      // The throw is caught by the outer try/catch and goes through the
+      // fail-open log path, same as any other INSERT-time failure.
+      $encodedPayload = json_encode(
+        $payload,
+        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+      );
+
+      $connection->insert($tableName, [
+        'store_id'       => $storeId,
+        'payload'        => $encodedPayload,
+        'status'         => 0,
+        'uri'            => $this->getWebhookUrl(),
+        'state'          => 'pending',
+        'retry_count'    => 0,
+        'next_attempt_at'=> new \Zend_Db_Expr('NOW()'),
+        'locked_until'   => null,
+        'locked_by'      => null,
+      ]);
+    } catch (\Exception $e) {
+      // Fail open: do not rethrow. Write structured error to dedicated log file.
+      $eventType  = $payload['event']['type']  ?? 'unknown';
+      $eventName  = $payload['event']['name']  ?? 'unknown';
+      $storeId    = $payload['event']['store']['id'] ?? null;
+      $errorClass = get_class($e);
+      // Truncate message to 200 chars to avoid leaking sensitive DB details.
+      $errorMsg   = substr($e->getMessage(), 0, 200);
+
+      $entry = json_encode([
+        'timestamp'     => date('c'),
+        'event_type'    => $eventType,
+        'event_name'    => $eventName,
+        'store_id'      => $storeId,
+        'error_class'   => $errorClass,
+        'error_message' => $errorMsg,
+      ], JSON_UNESCAPED_SLASHES);
+
+      $logPath = $this->_directoryList->getPath('var') . '/log/kustomer_webhook_enqueue_failure.log';
+      error_log($entry . PHP_EOL, 3, $logPath);
+    }
+  }
+
+  /**
+   * Deliver a queued event over HTTP.
+   *
+   * Loads the stored payload and performs the HMAC + cURL exchange.
+   * Does NOT touch any state column — that is the caller's responsibility.
+   *
+   * @param int    $eventId
+   * @param string $workerId  Caller's lease owner; row is only delivered if
+   *                          this worker still owns an unexpired lease.
+   * @return string|null  null on HTTP 200; otherwise a truncated error message
+   *                      that the caller should persist via recordFailedAttempt.
+   */
+  public function deliverEvent(int $eventId, string $workerId): ?string
+  {
+    $connection = $this->_resourceConnection->getConnection();
+    $tableName  = $this->_resourceConnection->getTableName('kustomer_webhook_integration_events');
+
+    // Verify lease ownership before any external side effect. Without this
+    // check, a worker whose lease has already expired and been recovered by
+    // another worker would still perform the HTTP POST, producing a duplicate
+    // delivery whose DB-side update is later rejected by the conditional
+    // UPDATE — visible to the caller as a logged warning, but invisible to
+    // Kustomer, which has already received the redundant webhook.
+    //
+    // The window cannot be eliminated entirely (the lease can expire between
+    // this SELECT and the cURL completion), but the check shrinks it from
+    // "the entire claim → cURL latency" to "the SELECT → cURL gap." Kustomer
+    // idempotency on stable externalId is still the load-bearing safety net.
+    $row = $connection->fetchRow(
+      $connection->select()
+        ->from($tableName)
+        ->where('event_id = ?', $eventId)
+        ->where('state = ?', 'processing')
+        ->where('locked_by = ?', $workerId)
+        ->where('locked_until > NOW()')
+    );
+
+    if (!$row) {
+      $this->logger->warning('deliverEvent: lease no longer owned, skipping delivery', [
+        'event_id'  => $eventId,
+        'worker_id' => $workerId,
+      ]);
+      return 'lease no longer owned';
+    }
+
+    $payload = json_decode($row['payload'], true);
+    if ($payload === null) {
+      $this->logger->error('deliverEvent: failed to decode payload', ['event_id' => $eventId]);
+      return 'failed to decode payload';
+    }
+
+    try {
+      $this->performHttpDelivery($payload);
+      return null;
+    } catch (\Exception $e) {
+      $errorMsg = substr($e->getMessage(), 0, 200);
+      $this->logger->error('deliverEvent: HTTP delivery failed', [
+        'event_id'   => $eventId,
+        'error_class' => get_class($e),
+        'error'      => $errorMsg,
+      ]);
+      return $errorMsg;
+    }
+  }
+
+  /**
+   * Transition a processing row back to 'failed'.
+   *
+   * Mirrors o-webhooks-worker convention: there is a single 'failed' state.
+   * Terminal vs retryable is encoded by next_attempt_at:
+   *   - retry_count >= MAX_RETRIES  → next_attempt_at = NULL (terminal)
+   *   - else                        → next_attempt_at = NOW() + backoff (retryable)
+   *
+   * Uses a conditional UPDATE with locked_by = $expectedLockedBy so that
+   * a stale worker cannot overwrite a row already reclaimed by another worker.
+   *
+   * @param int    $eventId
+   * @param string $error             Short error description (no PII).
+   * @param string $expectedLockedBy  Worker UUID that owns the lease.
+   * @param bool   $requireExpiredLease  If true, also requires locked_until <= NOW().
+   * @return bool  true if a row was updated, false if another worker already transitioned it.
+   */
+  public function recordFailedAttempt(
+    int $eventId,
+    string $error,
+    string $expectedLockedBy,
+    bool $requireExpiredLease = false
+  ): bool {
+    $connection = $this->_resourceConnection->getConnection();
+    $tableName  = $this->_resourceConnection->getTableName('kustomer_webhook_integration_events');
+
+    // Read current retry_count.
+    $row = $connection->fetchRow(
+      $connection->select()
+        ->from($tableName, ['retry_count'])
+        ->where('event_id = ?', $eventId)
+        ->where('state = ?', 'processing')
+        ->where('locked_by = ?', $expectedLockedBy)
+    );
+
+    if (!$row) {
+      // Another worker already transitioned this row.
+      return false;
+    }
+
+    $newRetryCount = (int)$row['retry_count'] + 1;
+
+    // Build WHERE conditions as strings (bound separately) to avoid ambiguity
+    // with Magento's update() array-where handling for non-placeholder entries.
+    $whereConditions = [
+      $connection->quoteInto('event_id = ?', $eventId),
+      $connection->quoteInto('state = ?', 'processing'),
+      $connection->quoteInto('locked_by = ?', $expectedLockedBy),
+    ];
+    if ($requireExpiredLease) {
+      $whereConditions[] = 'locked_until <= NOW()';
+    }
+    $whereSql = implode(' AND ', $whereConditions);
+
+    $data = [
+      'state'       => 'failed',
+      'status'      => $this->stateToStatus('failed'),
+      'retry_count' => $newRetryCount,
+      'error'       => $this->sanitizeErrorForPersistence($error),
+      'locked_by'   => null,
+      'locked_until'=> null,
+    ];
+
+    if ($newRetryCount > self::MAX_RETRIES) {
+      // Terminal: NULL next_attempt_at signals "won't retry."
+      // newRetryCount==MAX_RETRIES is still retryable (uses ladder's last
+      // entry) — terminal only fires once retries are exhausted.
+      $data['next_attempt_at'] = null;
+    } else {
+      // Retryable: schedule next attempt per the backoff ladder.
+      // newRetryCount is the post-increment count (1 after first failure),
+      // so the ladder is indexed by (newRetryCount - 1) to use ladder[0]
+      // for the wait between attempt 1 and attempt 2.
+      $backoffSeconds = self::$backoffLadder[
+        min($newRetryCount - 1, count(self::$backoffLadder) - 1)
+      ];
+      $data['next_attempt_at'] = new \Zend_Db_Expr(
+        'DATE_ADD(NOW(), INTERVAL ' . (int)$backoffSeconds . ' SECOND)'
+      );
+    }
+
+    $affected = $connection->update($tableName, $data, $whereSql);
+    return $affected > 0;
+  }
+
+  /**
+   * Reset a terminal row so the cron consumer will re-attempt delivery.
+   * Called by the admin Retry action in PR 4. Not yet invoked in PR 3.
+   *
+   * Resets state to 'pending' with retry_count=0, mirroring a fresh enqueue.
+   * The row is immediately eligible because next_attempt_at = NOW().
+   *
+   * Guarded by a conditional predicate so a double-clicked admin button
+   * (or any caller that races with the cron consumer) cannot yank an
+   * in-flight row out from under a worker. Only terminally-failed rows
+   * are eligible, matching the gate in the admin Retry controller.
+   *
+   * @param int $eventId
+   * @return bool true if a row was reset, false if it was not terminal-failed.
+   */
+  public function requeueForRetry(int $eventId): bool
+  {
+    $connection = $this->_resourceConnection->getConnection();
+    $tableName  = $this->_resourceConnection->getTableName('kustomer_webhook_integration_events');
+
+    $affected = $connection->update(
+      $tableName,
+      [
+        'state'           => 'pending',
+        'status'          => 0,
+        'retry_count'     => 0,
+        'next_attempt_at' => new \Zend_Db_Expr('NOW()'),
+        'locked_by'       => null,
+        'locked_until'    => null,
+        'error'           => null,
+      ],
+      [
+        'event_id = ?'      => $eventId,
+        'state = ?'         => 'failed',
+        'next_attempt_at IS NULL',
+      ]
+    );
+
+    return $affected > 0;
+  }
+
+  // -------------------------------------------------------------------------
+  // Internal HTTP delivery — shared by deliverEvent() and the legacy send()/retry()
+  // -------------------------------------------------------------------------
+
+  /**
+   * Perform the HMAC-signed cURL POST to the Kustomer webhook endpoint.
+   * Throws on non-200 or cURL error. Does not write any DB rows.
+   *
+   * @param array $payload
+   * @return mixed  Decoded JSON response body.
+   * @throws \Exception
+   */
+  private function performHttpDelivery(array $payload)
+  {
+    return $this->sendApiRequest($payload);
   }
 
   /**
@@ -264,12 +631,28 @@ class Data extends AbstractHelper
     // Create a new event model
     $event = $this->eventFactory->create();
 
-    // Set the event data
+    // Populate the new state-machine columns alongside the legacy status.
+    // The synchronous send path makes a single attempt with no auto-retry,
+    // so the outcome is always terminal: success → 'succeeded', failure →
+    // 'failed' with next_attempt_at NULL (which is how the new admin Retry
+    // gate identifies terminal-failed rows eligible for manual requeue).
+    // Without this, rows written during the PR 3 / PR 4 deployment window
+    // would carry schema defaults (state='pending', next_attempt_at=NULL)
+    // that misrepresent the row in the admin grid and fail PR 4's gate.
+    // store_id is a NOT NULL FK; the pre-PR3 saveRequest never wrote it and
+    // relied on MySQL's silent coercion to 0 (the admin scope). enqueue()
+    // already fixes this for the async path; mirror the fix here so the
+    // synchronous and async writers agree during the PR 3 → PR 4 window.
+    $isSuccess = $error === null;
     $event->setData([
-      'payload' => json_encode($payload),
-      'status' => $error !== null ? 0 : 1,
-      'uri' => $this->getWebhookUrl(),
-      'error' => $error,
+      'store_id'        => (int) ($payload['event']['store']['id'] ?? 0),
+      'payload'         => json_encode($payload),
+      'status'          => $isSuccess ? 1 : 0,
+      'uri'             => $this->getWebhookUrl(),
+      'error'           => $error,
+      'state'           => $isSuccess ? 'succeeded' : 'failed',
+      'retry_count'     => $isSuccess ? 0 : 1,
+      'next_attempt_at' => null,
     ]);
 
     // Save the event
@@ -290,13 +673,23 @@ class Data extends AbstractHelper
     // Load the event
     $event = $this->eventFactory->create()->load($eventId);
 
-    // Update the event data
+    // Same state-mirror invariant as saveRequest(): the synchronous retry
+    // path is one-shot, so both outcomes are terminal in the new state model.
+    // retry_count is incremented to reflect the additional attempt.
+    // Re-assert store_id from the payload so a row originally written under
+    // the pre-PR3 buggy path (which omitted store_id and got an implicit 0)
+    // is corrected on retry.
+    $isSuccess = $error === null;
     $event->addData([
-      'payload' => json_encode($payload),
-      'status' => $error !== null ? 0 : 1,
-      'uri' => $this->getWebhookUrl(),
-      'error' => $error,
-      'last_sent_at' => date('Y-m-d H:i:s', time()),
+      'store_id'        => (int) ($payload['event']['store']['id'] ?? 0),
+      'payload'         => json_encode($payload),
+      'status'          => $isSuccess ? 1 : 0,
+      'uri'             => $this->getWebhookUrl(),
+      'error'           => $error,
+      'last_sent_at'    => date('Y-m-d H:i:s', time()),
+      'state'           => $isSuccess ? 'succeeded' : 'failed',
+      'retry_count'     => (int)$event->getData('retry_count') + 1,
+      'next_attempt_at' => null,
     ]);
 
     // Update the event
