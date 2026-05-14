@@ -73,6 +73,16 @@ class Data extends AbstractHelper
    */
   protected $_resourceConnection;
 
+  /**
+   * @var \Psr\Log\LoggerInterface
+   */
+  protected $logger;
+
+  /**
+   * @var EventFactory
+   */
+  protected $eventFactory;
+
   public function __construct(
     Context $context,
     EventFactory $eventFactory,

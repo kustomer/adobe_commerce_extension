@@ -9,11 +9,10 @@ use Magento\Sales\Api\OrderRepositoryInterface;
 
 class OrderAddress implements ObserverInterface
 {
-  /**
-   * Constructor
-   * @param Data $helper
-   * @param OrderRepositoryInterface $orderRepository
-   */
+  protected Data $helper;
+
+  protected OrderRepositoryInterface $_orderRepository;
+
   public function __construct(Data $helper, OrderRepositoryInterface $orderRepository)
   {
     $this->helper = $helper;

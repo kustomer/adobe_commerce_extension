@@ -8,10 +8,8 @@ use Kustomer\WebhookIntegration\Helper\Data;
 
 class Address implements ObserverInterface
 {
-  /**
-   * Constructor
-   * @param Data $helper
-   */
+  protected Data $helper;
+
   public function __construct(Data $helper)
   {
     $this->helper = $helper;
