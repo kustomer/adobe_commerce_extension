@@ -58,19 +58,10 @@ class Retry extends Action
       if (!$row) {
         $this->_messageManager->addErrorMessage(__('Event #%1 not found.', $id));
       } else {
-        $state = $row['state'] ?? null;
-
-        // Allow retry only for terminal failures. In the o-webhooks-worker-aligned
-        // state model, "terminal" is encoded as state='failed' AND next_attempt_at IS NULL
-        // (matches the canonical "failed transaction with no nextRetry" pattern).
-        // Also allow for unmigrated edge-case rows where state is NULL and status = 0.
-        $isTerminal = (
-          $state === 'failed' && $row['next_attempt_at'] === null
-        ) || (
-          $state === null && (int)$row['status'] === 0
-        );
-
-        if ($isTerminal) {
+        // isEventTerminal centralizes the terminal-failure definition shared
+        // with requeueForRetry's SQL predicate, so changing what counts as
+        // "terminal" only happens in one place.
+        if ($this->_webhookHelper->isEventTerminal($row)) {
           // requeueForRetry returns false if a concurrent state change (cron
           // claim, double-clicked Retry button) means the row no longer matches
           // the terminal predicate. Surface that as an error so the admin gets
@@ -85,7 +76,7 @@ class Retry extends Action
             ));
           }
         } else {
-          $displayState = $state ?? 'unknown';
+          $displayState = $row['state'] ?? 'unknown';
           $this->_messageManager->addErrorMessage(__(
             'Event #%1 cannot be retried in state "%2"; only terminally-failed events are eligible.',
             $id,

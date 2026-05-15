@@ -594,6 +594,28 @@ class Data extends AbstractHelper
   }
 
   /**
+   * Return true if a row (as returned by loadEventState) is terminally
+   * failed and eligible for admin retry.
+   *
+   * "Terminal" = either a migrated row (state='failed' with next_attempt_at
+   * NULL) or a legacy unmigrated row (state IS NULL with status=0). The SQL
+   * predicate inside requeueForRetry must stay in sync with this check; if
+   * the definition of "terminal" changes, both move together.
+   *
+   * @param array $row
+   * @return bool
+   */
+  public function isEventTerminal(array $row): bool
+  {
+    $state = $row['state'] ?? null;
+    return (
+      $state === 'failed' && ($row['next_attempt_at'] ?? null) === null
+    ) || (
+      $state === null && (int)($row['status'] ?? 0) === 0
+    );
+  }
+
+  /**
    * Reset a terminal row so the cron consumer will re-attempt delivery.
    * Called by the admin Retry action in PR 4. Not yet invoked in PR 3.
    *
@@ -613,11 +635,11 @@ class Data extends AbstractHelper
     $connection = $this->_resourceConnection->getConnection();
     $tableName  = $this->_resourceConnection->getTableName('kustomer_webhook_integration_events');
 
-    // Predicate mirrors the terminal gate in the admin Retry controller:
-    // either a migrated row (state='failed' with next_attempt_at NULL) or a
-    // legacy unmigrated row (state IS NULL with status=0). PR 2's backfill
-    // normalizes legacy rows, so the second branch is only reachable if
-    // setup:upgrade hasn't been run yet — kept as defense in depth.
+    // SQL form of isEventTerminal(): either a migrated row (state='failed'
+    // with next_attempt_at NULL) or a legacy unmigrated row (state IS NULL
+    // with status=0). PR 2's backfill normalizes legacy rows, so the second
+    // branch is only reachable if setup:upgrade hasn't been run yet — kept
+    // as defense in depth. Keep this predicate in sync with isEventTerminal.
     $affected = $connection->update(
       $tableName,
       [
