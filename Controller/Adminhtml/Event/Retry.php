@@ -71,8 +71,19 @@ class Retry extends Action
         );
 
         if ($isTerminal) {
-          $this->_webhookHelper->requeueForRetry($id);
-          $this->_messageManager->addSuccessMessage(__('Event #%1 queued for retry.', $id));
+          // requeueForRetry returns false if a concurrent state change (cron
+          // claim, double-clicked Retry button) means the row no longer matches
+          // the terminal predicate. Surface that as an error so the admin gets
+          // honest feedback instead of a false-positive "queued".
+          $requeued = $this->_webhookHelper->requeueForRetry($id);
+          if ($requeued) {
+            $this->_messageManager->addSuccessMessage(__('Event #%1 queued for retry.', $id));
+          } else {
+            $this->_messageManager->addErrorMessage(__(
+              'Event #%1 could not be queued for retry; its state changed concurrently. Refresh and try again.',
+              $id
+            ));
+          }
         } else {
           $displayState = $state ?? 'unknown';
           $this->_messageManager->addErrorMessage(__(

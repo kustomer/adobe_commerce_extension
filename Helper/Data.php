@@ -613,6 +613,11 @@ class Data extends AbstractHelper
     $connection = $this->_resourceConnection->getConnection();
     $tableName  = $this->_resourceConnection->getTableName('kustomer_webhook_integration_events');
 
+    // Predicate mirrors the terminal gate in the admin Retry controller:
+    // either a migrated row (state='failed' with next_attempt_at NULL) or a
+    // legacy unmigrated row (state IS NULL with status=0). PR 2's backfill
+    // normalizes legacy rows, so the second branch is only reachable if
+    // setup:upgrade hasn't been run yet — kept as defense in depth.
     $affected = $connection->update(
       $tableName,
       [
@@ -625,9 +630,8 @@ class Data extends AbstractHelper
         'error'           => null,
       ],
       [
-        'event_id = ?'      => $eventId,
-        'state = ?'         => 'failed',
-        'next_attempt_at IS NULL',
+        'event_id = ?' => $eventId,
+        "((state = 'failed' AND next_attempt_at IS NULL) OR (state IS NULL AND status = 0))",
       ]
     );
 
