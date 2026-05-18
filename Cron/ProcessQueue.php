@@ -147,6 +147,12 @@ class ProcessQueue
     // 'failed' state with terminal failures, distinguished by next_attempt_at.
     // The IS NOT NULL + <= NOW() predicate excludes terminal failures
     // (next_attempt_at IS NULL) naturally.
+    //
+    // BATCH_SIZE is interpolated rather than bound because MariaDB / MySQL
+    // refuse parameter placeholders for LIMIT (PDO emulation quotes the int
+    // as 'N', which is a syntax error in that position). Safe to inline: it
+    // is a class constant, never user input.
+    $batchSize = (int) self::BATCH_SIZE;
     $claimSql = "UPDATE `{$tableName}`
 SET
     `state`        = 'processing',
@@ -157,11 +163,10 @@ WHERE `state` IN ('pending', 'failed')
   AND `next_attempt_at` IS NOT NULL
   AND `next_attempt_at` <= NOW()
 ORDER BY `created_at` ASC
-LIMIT :batch_size";
+LIMIT {$batchSize}";
 
     $connection->query($claimSql, [
       'worker_id'  => $workerId,
-      'batch_size' => self::BATCH_SIZE,
     ]);
 
     // Read back the rows we just claimed.

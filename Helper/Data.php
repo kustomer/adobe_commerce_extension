@@ -307,7 +307,7 @@ class Data extends AbstractHelper
 
   // -------------------------------------------------------------------------
   // Queue helpers (added in PR 3 — used by cron consumer; not yet called by
-  // send() or retry(), which remain synchronous until PR 4).
+  // send() (activated in PR 4).
   // -------------------------------------------------------------------------
 
   /**
@@ -574,6 +574,48 @@ class Data extends AbstractHelper
   }
 
   /**
+   * Load the state and status of a queued event row.
+   *
+   * @param int $eventId
+   * @return array|null  Associative array with 'state' and 'status' keys, or null if not found.
+   */
+  public function loadEventState(int $eventId): ?array
+  {
+    $connection = $this->_resourceConnection->getConnection();
+    $tableName  = $this->_resourceConnection->getTableName('kustomer_webhook_integration_events');
+
+    $row = $connection->fetchRow(
+      $connection->select()
+        ->from($tableName, ['state', 'status', 'next_attempt_at'])
+        ->where('event_id = ?', $eventId)
+    );
+
+    return $row ?: null;
+  }
+
+  /**
+   * Return true if a row (as returned by loadEventState) is terminally
+   * failed and eligible for admin retry.
+   *
+   * "Terminal" = either a migrated row (state='failed' with next_attempt_at
+   * NULL) or a legacy unmigrated row (state IS NULL with status=0). The SQL
+   * predicate inside requeueForRetry must stay in sync with this check; if
+   * the definition of "terminal" changes, both move together.
+   *
+   * @param array $row
+   * @return bool
+   */
+  public function isEventTerminal(array $row): bool
+  {
+    $state = $row['state'] ?? null;
+    return (
+      $state === 'failed' && ($row['next_attempt_at'] ?? null) === null
+    ) || (
+      $state === null && (int)($row['status'] ?? 0) === 0
+    );
+  }
+
+  /**
    * Reset a terminal row so the cron consumer will re-attempt delivery.
    * Called by the admin Retry action in PR 4. Not yet invoked in PR 3.
    *
@@ -593,6 +635,11 @@ class Data extends AbstractHelper
     $connection = $this->_resourceConnection->getConnection();
     $tableName  = $this->_resourceConnection->getTableName('kustomer_webhook_integration_events');
 
+    // SQL form of isEventTerminal(): either a migrated row (state='failed'
+    // with next_attempt_at NULL) or a legacy unmigrated row (state IS NULL
+    // with status=0). PR 2's backfill normalizes legacy rows, so the second
+    // branch is only reachable if setup:upgrade hasn't been run yet — kept
+    // as defense in depth. Keep this predicate in sync with isEventTerminal.
     $affected = $connection->update(
       $tableName,
       [
@@ -605,9 +652,8 @@ class Data extends AbstractHelper
         'error'           => null,
       ],
       [
-        'event_id = ?'      => $eventId,
-        'state = ?'         => 'failed',
-        'next_attempt_at IS NULL',
+        'event_id = ?' => $eventId,
+        "((state = 'failed' AND next_attempt_at IS NULL) OR (state IS NULL AND status = 0))",
       ]
     );
 
@@ -615,7 +661,7 @@ class Data extends AbstractHelper
   }
 
   // -------------------------------------------------------------------------
-  // Internal HTTP delivery — shared by deliverEvent() and the legacy send()/retry()
+  // Internal HTTP delivery — used by deliverEvent()
   // -------------------------------------------------------------------------
 
   /**
@@ -629,84 +675,6 @@ class Data extends AbstractHelper
   private function performHttpDelivery(array $payload)
   {
     return $this->sendApiRequest($payload);
-  }
-
-  /**
-   * @param array $payload
-   * @param string|null $error
-   * @return int
-   */
-  private function saveRequest(array $payload, $error)
-  {
-    // Create a new event model
-    $event = $this->eventFactory->create();
-
-    // Populate the new state-machine columns alongside the legacy status.
-    // The synchronous send path makes a single attempt with no auto-retry,
-    // so the outcome is always terminal: success → 'succeeded', failure →
-    // 'failed' with next_attempt_at NULL (which is how the new admin Retry
-    // gate identifies terminal-failed rows eligible for manual requeue).
-    // Without this, rows written during the PR 3 / PR 4 deployment window
-    // would carry schema defaults (state='pending', next_attempt_at=NULL)
-    // that misrepresent the row in the admin grid and fail PR 4's gate.
-    // store_id is a NOT NULL FK; the pre-PR3 saveRequest never wrote it and
-    // relied on MySQL's silent coercion to 0 (the admin scope). enqueue()
-    // already fixes this for the async path; mirror the fix here so the
-    // synchronous and async writers agree during the PR 3 → PR 4 window.
-    $isSuccess = $error === null;
-    $event->setData([
-      'store_id'        => (int) ($payload['event']['store']['id'] ?? 0),
-      'payload'         => json_encode($payload),
-      'status'          => $isSuccess ? 1 : 0,
-      'uri'             => $this->getWebhookUrl(),
-      'error'           => $error,
-      'state'           => $isSuccess ? 'succeeded' : 'failed',
-      'retry_count'     => $isSuccess ? 0 : 1,
-      'next_attempt_at' => null,
-    ]);
-
-    // Save the event
-    $event->save();
-
-    // Return the event ID
-    return $event->getId();
-  }
-
-  /**
-   * @param array $payload
-   * @param string|null $error
-   * @param string $eventId
-   * @return int
-   */
-  private function updateRequest(array $payload, $error, $eventId)
-  {
-    // Load the event
-    $event = $this->eventFactory->create()->load($eventId);
-
-    // Same state-mirror invariant as saveRequest(): the synchronous retry
-    // path is one-shot, so both outcomes are terminal in the new state model.
-    // retry_count is incremented to reflect the additional attempt.
-    // Re-assert store_id from the payload so a row originally written under
-    // the pre-PR3 buggy path (which omitted store_id and got an implicit 0)
-    // is corrected on retry.
-    $isSuccess = $error === null;
-    $event->addData([
-      'store_id'        => (int) ($payload['event']['store']['id'] ?? 0),
-      'payload'         => json_encode($payload),
-      'status'          => $isSuccess ? 1 : 0,
-      'uri'             => $this->getWebhookUrl(),
-      'error'           => $error,
-      'last_sent_at'    => date('Y-m-d H:i:s', time()),
-      'state'           => $isSuccess ? 'succeeded' : 'failed',
-      'retry_count'     => (int)$event->getData('retry_count') + 1,
-      'next_attempt_at' => null,
-    ]);
-
-    // Update the event
-    $event->save();
-
-    // Return the event ID
-    return $event->getId();
   }
 
   /**
@@ -825,90 +793,8 @@ class Data extends AbstractHelper
    */
   public function send($payload)
   {
-    $token = $this->getSecurityToken();
-
-    $this->logger->info('Sending data to Kustomer', [
-      'event_type' => $payload['event']['type'] ?? null,
-      'event_name' => $payload['event']['name'] ?? null,
-    ]);
-
-    // Set the event ID to null
-    $eventId = null;
-
-    // Add the store data to the payload event
     $payload['event']['store'] = $this->getStoreData();
-
-    try {
-      // Try to send the payload
-      $response = $this->sendApiRequest($payload);
-
-      // Log the success
-      $this->logger->info('Data sent to Kustomer successfully');
-
-      // And save the request
-      $eventId = $this->saveRequest($payload, null);
-    } catch (\Exception $e) {
-      // Get the error message
-      $message = $e->getMessage();
-
-      // If there's an error, log it
-      $this->logger->error('Error sending data to Kustomer', [
-        'error' => $message,
-      ]);
-
-      // And save the error
-      $eventId = $this->saveRequest($payload, $message);
-    }
-
-    // Log the event ID now that it was set
-    $this->logger->info('Saved request to Magento DB', [
-      'event_id' => $eventId,
-    ]);
-  }
-
-  /**
-   * @param string $eventId
-   */
-  public function retry($eventId)
-  {
-    // Get the payload
-    $event = $this->eventFactory->create()->load($eventId);
-    $payload = json_decode($event->getData('payload'), true);
-
-    $this->logger->info('Retrying the sending of data to Kustomer', [
-      'event_id'   => $eventId,
-      'event_type' => $payload['event']['type'] ?? null,
-      'event_name' => $payload['event']['name'] ?? null,
-    ]);
-
-    try {
-      // Try to send the payload
-      $response = $this->sendApiRequest($payload);
-
-      // Log the success
-      $this->logger->info('Data retry sent to Kustomer successfully', [
-        'response' => $response,
-      ]);
-
-      // And update the request
-      $this->updateRequest($payload, null, $eventId);
-    } catch (\Exception $e) {
-      // Get the error message
-      $message = $e->getMessage();
-
-      // If there's an error, log it
-      $this->logger->error('Error retrying the sending of data to Kustomer', [
-        'error' => $message,
-      ]);
-
-      // And update the error
-      $this->updateRequest($payload, $message, $eventId);
-    }
-
-    // Log the event ID
-    $this->logger->info('Saved request to Magento DB', [
-      'event_id' => $eventId,
-    ]);
+    $this->enqueue($payload);
   }
 
   public function export()
